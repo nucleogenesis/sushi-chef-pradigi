@@ -1,3 +1,4 @@
+import ssl
 import hashlib
 import logging
 import os
@@ -12,6 +13,9 @@ from ricecooker.config import LOGGER
 from ricecooker.utils.html import download_file
 from ricecooker.utils.zip import create_predictable_zip
 
+ssl._create_default_https_context = ssl._create_unverified_context
+
+
 
 from corrections import (PRADIGI_CORRECTIONS_LIST, CORRECTIONS_ACTION_KEY,
                          ADD_MARGIN_TOP_ACTION, CORRECTIONS_SOURCE_URL_PAT_KEY)
@@ -22,7 +26,7 @@ LOGGER.setLevel(logging.DEBUG)
 
 
 
-# GAME_THUMBS_LOCAL_DIR = 'chefdata/gamethumbnails'
+GAME_THUMBS_LOCAL_DIR = 'chefdata/gamethumbnails'
 HTML5APP_ZIPS_LOCAL_DIR = 'chefdata/zipfiles'
 
 
@@ -31,8 +35,11 @@ HTML5APP_ZIPS_LOCAL_DIR = 'chefdata/zipfiles'
 # ZIP FILE DOWNLOADING, TRANFORMS, AND FIXUPS
 ################################################################################
 
+
 def make_request(url):
-    response = requests.get(url)
+    #if 'http' in url and 'https' not in url:
+        #url = url.replace('http', 'https')
+    response = requests.get(url, verify=False)
     if response.status_code != 200:
         LOGGER.error("ERROR when GETting: %s" % (url))
     return response
@@ -81,13 +88,13 @@ def get_zip_file(zip_file_url, main_file):
 
     # return cached version if already there
     final_webroot_path = os.path.join(destpath, 'webroot.zip')
-    if os.path.exists(final_webroot_path):
-        return final_webroot_path
-    else:
-        LOGGER.error("Now we need local files so we can process them: %s" % final_webroot_path)
 
+    zip_filename = zip_file_url.split('/')[-1].replace('(', '_').replace(')', '_')         # e.g. Mathematics.zip
+    final_exists_zip = os.path.join(destpath, zip_filename)
     try:
-        download_file(zip_file_url, destpath, request_fn=make_request)
+        if not os.path.exists(final_exists_zip):
+            logging.error("PATH_NOT_FOUND: {}".format(final_exists_zip))
+            download_file(zip_file_url, destpath, request_fn=make_request)
 
         zip_filename = zip_file_url.split('/')[-1]         # e.g. Mathematics.zip
         zip_basename = zip_filename.rsplit('.', 1)[0]      # e.g. Mathematics/
@@ -128,14 +135,18 @@ def get_zip_file(zip_file_url, main_file):
         # of the same as the zip filename. We need to recreate these zip files
         # to make sure the index.html is in the root of the zip.
         local_zip_file = os.path.join(destpath, zip_filename)
-        with zipfile.ZipFile(local_zip_file) as zf:
-            # If main_file is in the root (like zips from the game repository)
-            # then we need to extract the zip contents to subfolder zip_basename/
-            for zfileinfo in zf.filelist:
-                if zfileinfo.filename == main_file:
-                    destpath = os.path.join(destpath, zip_basename)
-            # Extract zip so main file will be in destpath/zip_basename/index.html
-            zf.extractall(destpath)
+        try:
+            with zipfile.ZipFile(local_zip_file) as zf:
+                # If main_file is in the root (like zips from the game repository)
+                # then we need to extract the zip contents to subfolder zip_basename/
+                for zfileinfo in zf.filelist:
+                    if zfileinfo.filename == main_file:
+                        destpath = os.path.join(destpath, zip_basename)
+                # Extract zip so main file will be in destpath/zip_basename/index.html
+                zf.extractall(destpath)
+        except zipfile.BadZipFile as e:
+            LOGGER.error("BadZipFile: %s, %s, %s" % (zip_file_url, main_file, e))
+            return None
 
         # In some cases, the files are under the www directory,
         # let's move them up one level.
@@ -143,21 +154,28 @@ def get_zip_file(zip_file_url, main_file):
         if os.path.isdir(www_dir):
             files = os.listdir(www_dir)
             for f in files:
-                shutil.move(os.path.join(www_dir, f), zip_folder)
+                if not os.path.exists(os.path.join(zip_folder, f)):
+                    shutil.move(os.path.join(www_dir, f), zip_folder)
+                #print('ok')
 
         # Rename `main_file` to index.html
         src = os.path.join(zip_folder, main_file)
         dest = os.path.join(zip_folder, 'index.html')
-        os.rename(src, dest)
+        #print("renaming stuffs", src, dest)
+        if os.path.exists(src):
+            os.rename(src, dest)
+        #print("did it")
 
         # Logic to add margin-top:44px; for games that match Corrections tab
         add_margin_top = False
+        #print("MAKING MARGIN")
         for row in PRADIGI_CORRECTIONS_LIST:
             if row[CORRECTIONS_ACTION_KEY] == ADD_MARGIN_TOP_ACTION:
                 pat = row[CORRECTIONS_SOURCE_URL_PAT_KEY]
                 m = pat.match(zip_file_url)
                 if m:
                     add_margin_top = True
+        #print("TRRRRRP", zip_filename)
         if add_margin_top:
             if zip_file_url.endswith('CourseContent/Games/Mathematics.zip'):
                 LOGGER.info("adding body.margin-top:44px; to ALL .html files in: %s" % zip_file_url)
@@ -170,31 +188,21 @@ def get_zip_file(zip_file_url, main_file):
                 add_body_margin_top(zip_folder, 'index.html')
 
         # Replace occurences of `main_file` with index.html to avoid broken links
+        #print("HERRRRRRRE")
         for root, dirs, files in os.walk(zip_folder):
             for file in files:
                 if file.endswith(".html") or file.endswith(".js"):
                     file_path = os.path.join(root, file)
                     # use bytes to avoid Unicode errors "invalid start/continuation byte"
-                    bytes_in = open(file_path, 'rb').read()
-                    bytes_out = bytes_in.replace(main_file.encode('utf-8'), b'index.html')
-                    open(file_path, 'wb').write(bytes_out)
+                    the_file = open(file_path, 'r')
+                    file_content = the_file.read()
+                    out_file = open(file_path, 'w')
+                    out_file.write(file_content.replace(main_file, 'index.html'))
 
-        for root, dirs, files in os.walk(zip_folder):
-            for file in files:
-                if file.endswith(".js"):
-                    LOGGER.info("Fixing Android bug in JS file: %s" % file)
-                    with open(file, 'w') as f:
-                        content = f.read()
-                        content = content.replace(
-                            'Utils.mobileDeviceFlag=true', 
-                            'Utils.mobileDeviceFlag=false'
-                        )
-                        f.write(content)
-                        f.close()
         # create the zip file and copy it to 
         tmp_predictable_zip_path = create_predictable_zip(zip_folder)
-        shutil.copyfile(tmp_predictable_zip_path, final_webroot_path)
-        return final_webroot_path
+        shutil.copyfile(tmp_predictable_zip_path, final_exists_zip)
+        return final_exists_zip
 
     except Exception as e:
         LOGGER.error("get_zip_file: %s, %s, %s, %s" %

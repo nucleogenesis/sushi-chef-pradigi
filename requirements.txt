@@ -1,4 +1,4 @@
-ricecooker>=0.6.30
+ricecooker>=0.7.1
 le-utils>=0.1.16
 git+https://github.com/learningequality/BasicCrawler@master
 Fabric3>=1.13.1

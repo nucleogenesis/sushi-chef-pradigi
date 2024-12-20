@@ -1,4 +1,5 @@
-#!/usr/bin/env python
+# CONSTANTS USED TO SELECT APPROPRIATE CLASS DURING DESERIALIZATION FROM JSON
+################################################################################
 """
 The PraDigi chef uses a mix of content from three sources:
 
@@ -23,13 +24,17 @@ import os
 import requests
 import shutil
 
-from le_utils.constants import content_kinds, file_types, licenses
+from le_utils.constants import content_kinds, file_types, licenses, format_presets
 from le_utils.constants.languages import getlang
 from ricecooker.chefs import JsonTreeChef
 from ricecooker.classes.licenses import get_license
+from ricecooker.classes.files import RemoteFile
 from ricecooker.config import LOGGER
 from ricecooker.utils.caching import (FileCache, CacheControlAdapter)
-from ricecooker.utils.jsontrees import write_tree_to_json_tree
+from ricecooker.utils.jsontrees import write_tree_to_json_tree, add_files, add_questions, read_tree_from_json
+from ricecooker.exceptions import raise_for_invalid_channel
+
+from kolibridb import get_nodes_for_remote_files
 
 from structure import GAMENAME_KEY, TAKE_FROM_KEY
 from structure import TEMPLATE_FOR_LANG
@@ -40,13 +45,19 @@ from transform import HTML5APP_ZIPS_LOCAL_DIR
 from transform import get_zip_file
 from transform import get_phet_zip_file
 from corrections import should_skip_file
+from ricecooker.classes import nodes
 
+from le_utils.constants import exercises
+from le_utils.constants import roles
+
+
+FAIL_FILES = []
 
 
 
 PRADIGI_DOMAIN = 'prathamopenschool.org'
-PRADIGI_SOURCE_ID__VARIANT_PRATHAM = 'pradigi-videos-and-games'  # Pratham internal 
-PRADIGI_SOURCE_ID__VARIANT_LE = 'pradigi-channel'                # Studio PUBLIC channel
+PRADIGI_SOURCE_ID__VARIANT_PRATHAM = 'pradigi-channel'
+PRADIGI_SOURCE_ID__VARIANT_LE = 'pradigi-channel'
 FULL_DOMAIN_URL = 'https://www.' + PRADIGI_DOMAIN
 PRADIGI_LICENSE = get_license(licenses.CC_BY_NC_SA, copyright_holder='PraDigi').as_dict()
 PRADIGI_WEBSITE_LANGUAGES = ['hi', 'mr', 'en', 'gu', 'kn', 'bn', 'ur', 'or', 'pnb', 'ta', 'te', 'as']
@@ -59,16 +70,47 @@ PRADIGI_DESCRIPTION = 'Developed by Pratham, these educational games, videos, ' 
 
 # In debug mode, only one topic is downloaded.
 LOGGER.setLevel(logging.DEBUG)
-DEBUG_MODE = True  # source_urls in content desriptions
+DEBUG_MODE = False # source_urls in content desriptions
 
 # WebCache logic (downloaded web resources cached for one day -- good for dev)
-cache = FileCache('.webcache')
+cache = FileCache('/home/jacob/LE/.pradigi-webcache')
 basic_adapter = CacheControlAdapter(cache=cache)
 develop_adapter = CacheControlAdapter(heuristic=OneDayCache(), cache=cache)
 session = requests.Session()
 session.mount('http://www.' + PRADIGI_DOMAIN, develop_adapter)
 session.mount('https://www.' + PRADIGI_DOMAIN, develop_adapter)
 
+
+TOPIC_NODE = content_kinds.TOPIC
+VIDEO_NODE = content_kinds.VIDEO
+AUDIO_NODE = content_kinds.AUDIO
+EXERCISE_NODE = content_kinds.EXERCISE
+DOCUMENT_NODE = content_kinds.DOCUMENT
+HTML5_NODE = content_kinds.HTML5
+SLIDESHOW_NODE = content_kinds.SLIDESHOW
+
+
+# TODO(Ivan): add constants.file_types to le_utils and discuss with Jordan
+
+VIDEO_FILE = file_types.VIDEO
+AUDIO_FILE = file_types.AUDIO
+DOCUMENT_FILE = file_types.DOCUMENT
+EPUB_FILE = file_types.EPUB
+HTML5_FILE = file_types.HTML5
+THUMBNAIL_FILE = file_types.THUMBNAIL
+SUBTITLES_FILE = file_types.SUBTITLES
+SLIDESHOW_IMAGE_FILE = file_types.SLIDESHOW_IMAGE
+REMOTE_FILE = "remote_file"
+
+
+INPUT_QUESTION = exercises.INPUT_QUESTION
+MULTIPLE_SELECTION = exercises.MULTIPLE_SELECTION
+SINGLE_SELECTION = exercises.SINGLE_SELECTION
+FREE_RESPONSE = exercises.FREE_RESPONSE
+PERSEUS_QUESTION = exercises.PERSEUS_QUESTION
+
+
+PRADIGI_CHANNEL_ID = "e832106c639854e181616015a8b87910"
 
 # SOURCE WEBSITES
 ################################################################################
@@ -400,7 +442,7 @@ PRADIGI_STRINGS = {
 def get_subtree_by_subject_en(lang, subject):
     if lang not in PRADIGI_LANG_URL_MAP:
         raise ValueError('Language `lang` must be in PRADIGI_LANG_URL_MAP')
-    wrt_filename = 'chefdata/vader/trees/pradigi_{}_web_resource_tree.json'.format(lang)
+    wrt_filename = 'chefdata/trees/pradigi_{}_web_resource_tree.json'.format(lang)
     with open(wrt_filename) as jsonfile:
         web_resource_tree = json.load(jsonfile)
     subject_subtrees = web_resource_tree['children']
@@ -425,7 +467,7 @@ def get_subtree_by_source_id(lang, source_id):
     """
     if lang not in PRADIGI_LANG_URL_MAP:
         raise ValueError('Language `lang` must be in PRADIGI_LANG_URL_MAP')
-    wrt_filename = 'chefdata/vader/trees/pradigi_{}_web_resource_tree.json'.format(lang)
+    wrt_filename = 'chefdata/trees/pradigi_{}_web_resource_tree.json'.format(lang)
     with open(wrt_filename) as jsonfile:
         web_resource_tree = json.load(jsonfile)
     # setup recusive find function
@@ -450,13 +492,15 @@ def wrt_to_ricecooker_tree(tree, lang, filter_fn=lambda node: True):
     """
     kind = tree['kind']
     if kind in ['topic_page', 'subtopic_page', 'lesson_page', 'fun_page', 'story_page', 'special_subtopic_page']:
-        thumbnail = tree['thumbnail_url'] if 'thumbnail_url' in tree else None
+        thumbnail = None
+
+
         topic_node = dict(
             kind=content_kinds.TOPIC,
             source_id=tree['source_id'],
             language=lang,
             title=tree['title'],  # or could get from Strings based on subject_en...
-            description='source_id=' + tree['source_id'] if DEBUG_MODE else '',
+            description='',  #source_id=' + tree['source_id'] if DEBUG_MODE else '',
             thumbnail=thumbnail,
             license=PRADIGI_LICENSE,
             children=[],
@@ -485,7 +529,7 @@ def wrt_to_ricecooker_tree(tree, lang, filter_fn=lambda node: True):
             source_id=tree['source_id'],
             language=lang,
             title=tree['title'],
-            description=tree.get('description', ''),
+            description='',
             thumbnail=thumbnail,
             license=PRADIGI_LICENSE,
             files=[],
@@ -506,28 +550,36 @@ def wrt_to_ricecooker_tree(tree, lang, filter_fn=lambda node: True):
     elif kind == 'PrathamZipResource':
         if should_skip_file(tree['url']):
             return None  # Skip games marked with the `SKIP GAME` correction actions
-        thumbnail = tree['thumbnail_url'] if 'thumbnail_url' in tree else None
+
+        thumbnail = None # tree['thumbnail_url'] if 'thumbnail_url' in tree else None
+
         html5_node = dict(
             kind=content_kinds.HTML5,
             source_id=tree['source_id'],
             language=lang,
             title=tree['title'],
-            description=tree.get('description', ''),
+            description='', #tree.get('description', ''),
             thumbnail=thumbnail,
             license=PRADIGI_LICENSE,
             files=[],
         )
+
         if 'phet.zip' in tree['url']:
             zip_tmp_path  = get_phet_zip_file(tree['url'], tree['main_file'])
         else:
             zip_tmp_path  = get_zip_file(tree['url'], tree['main_file'])
         if zip_tmp_path is None:
+            FAIL_FILES.append(tree['url'])
             raise ValueError('Could not get zip file from %s' % tree['url'])
         html5zip_file = dict(
             file_type=file_types.HTML5,
             path=zip_tmp_path,
             language=lang,
         )
+
+        child_node = nodes
+
+
         html5_node['files'].append(html5zip_file)
         return html5_node
 
@@ -538,7 +590,7 @@ def wrt_to_ricecooker_tree(tree, lang, filter_fn=lambda node: True):
             source_id=tree['source_id'],
             language=lang,
             title=tree['title'],
-            description=tree.get('description', ''),
+            description='', #tree.get('description', ''),
             thumbnail=thumbnail,
             license=PRADIGI_LICENSE,
             files=[],
@@ -586,7 +638,7 @@ def find_games_for_lang(name, lang, take_from=None):
     language_en = PRADIGI_STRINGS[lang]['language_en'] # ???
 
     # load website game web resource data
-    WEBSITE_GAMES_OUTPUT = 'chefdata/vader/trees/website_games_all_langs.json'
+    WEBSITE_GAMES_OUTPUT = 'chefdata/trees/website_games_all_langs.json'
     website_data = json.load(open(WEBSITE_GAMES_OUTPUT, 'r'))
     if lang in website_data:
         website_data_lang = website_data[lang]
@@ -611,7 +663,6 @@ def find_games_for_lang(name, lang, take_from=None):
 
     if len(games) == 0:
         pass
-        # print('game', name, 'not found for lang', lang)
 
     return games
 
@@ -629,9 +680,9 @@ def website_game_webresouce_to_ricecooker_node(lang, web_resource):
         source_id=web_resource['source_id'],
         language=lang,
         title=web_resource['title'],
-        description='source_url=' + web_resource['url'] if DEBUG_MODE else '',
+        description='',
         license=PRADIGI_LICENSE,
-        thumbnail=web_resource.get('thumbnail_url'),
+        thumbnail=None,# web_resource.get('thumbnail_url'),
         files=[],
     )
     zip_tmp_path = get_zip_file(web_resource['url'], web_resource['main_file'])
@@ -692,7 +743,7 @@ def extract_website_games_from_tree(lang):
     if lang not in PRADIGI_LANG_URL_MAP:
         raise ValueError('Language `lang` must be in PRADIGI_LANG_URL_MAP')
     # READ IN
-    wrt_filename = 'chefdata/vader/trees/pradigi_{}_web_resource_tree.json'.format(lang)
+    wrt_filename = 'chefdata/trees/pradigi_{}_web_resource_tree.json'.format(lang)
     with open(wrt_filename) as jsonfile:
         web_resource_tree = json.load(jsonfile)
     # PROCESS
@@ -713,7 +764,6 @@ def extract_website_games_from_tree(lang):
                         child_url = child_url.replace('https://www.prathamopenschool.org/CourseContent/Games/', '')
                         child_url = child_url.replace('http://www.prathamopenschool.org/CourseContent/Games/', '')
                         child['title_en'] = child_url.replace('.zip', '')
-                        print('EXTRACTED game name', child['title_en'], 'form url', child['url'])
                         website_games.append(child)
                     else:
                         # leave other games where they are
@@ -729,10 +779,300 @@ def extract_website_games_from_tree(lang):
     recursive_extract_website_games(web_resource_tree)
     return website_games
 
+REMOTE_NODES = get_nodes_for_remote_files(PRADIGI_CHANNEL_ID)
+
+def _set_thumbnail_file(self, preset):
+    content_node_id = self.get_node_id().hex
+    remote_node_files = REMOTE_NODES.get(content_node_id, {}).get('files', [])
+    for file in remote_node_files:
+        if file['preset'] == preset:
+            remote_file = RemoteFile(
+                file["checksum"],
+                file["extension"],
+                file["preset"],
+                is_primary=False
+            )
+            self.add_file(remote_file)
+            self.thumbnail = remote_file
 
 
 
 
+nodes.TopicNode._set_thumbnail_file = _set_thumbnail_file 
+nodes.HTML5AppNode._set_thumbnail_file = _set_thumbnail_file 
+nodes.StudioContentNode._set_thumbnail_file = _set_thumbnail_file 
+
+def build_tree_from_json(parent_node, sourcetree):
+    """
+    Recusively parse nodes in the list `sourcetree` and add them as children
+    to the `parent_node`. Usually called with `parent_node` being a `ChannelNode`.
+    """
+    EXPECTED_NODE_TYPES = [
+        TOPIC_NODE,
+        VIDEO_NODE,
+        AUDIO_NODE,
+        EXERCISE_NODE,
+        DOCUMENT_NODE,
+        HTML5_NODE,
+        SLIDESHOW_NODE,
+    ]
+    """
+    workout the node ID from the source_id -- node_id is based on tree position & source_id 
+    
+
+    Allow a JSON tree to accept a RemoteNode (aka StudioContentNode)
+    if kind == REMOTE_NODE:
+
+        child_node = nodes.RemoteNode(
+            source_id=source_node["source_id"],
+        )
+
+        child_node.get_node_id() # returns uid, call .hex?
+    """
+    print("building tree from json")
+
+    for source_node in sourcetree:
+        kind = source_node["kind"]
+        if kind not in EXPECTED_NODE_TYPES:
+            LOGGER.critical("Unexpected node kind found: " + kind)
+            raise NotImplementedError("Unexpected node kind found in json data.")
+
+        if kind == TOPIC_NODE:
+            child_node = nodes.TopicNode(
+                source_id=source_node.get("source_id", None),
+                title=source_node["title"],
+                description=source_node.get("description"),
+                author=source_node.get("author"),
+                aggregator=source_node.get("aggregator"),
+                provider=source_node.get("provider"),
+                # no role for topics (computed dynaically from descendants)
+                language=source_node.get("language"),
+                #thumbnail=source_node.get("thumbnail"),
+                derive_thumbnail=source_node.get("derive_thumbnail", False),
+                tags=source_node.get("tags"),
+            )
+            parent_node.add_child(child_node)
+            for i in range(len(parent_node.children)):
+                if parent_node.children[i].get_node_id().hex == child_node.get_node_id().hex:
+                    for j in range(len(parent_node.children[i].files)):
+                        if parent_node.children[i].files[j].preset == format_presets.TOPIC_THUMBNAIL:
+                            removed = parent_node.children[i].files.pop(j)
+                            logging.info("Removed thumbnail file from {}".format(parent_node.children[i].title))
+                    parent_node.children[i]._set_thumbnail_file(format_presets.TOPIC_THUMBNAIL)
+            source_tree_children = source_node.get("children", [])
+            build_tree_from_json(child_node, source_tree_children)
+
+        elif kind == VIDEO_NODE:
+            child_node = nodes.VideoNode(
+                source_id=source_node["source_id"],
+                title=source_node["title"],
+                description='',
+                license=get_license(**source_node["license"]),
+                author=source_node.get("author"),
+                aggregator=source_node.get("aggregator"),
+                provider=source_node.get("provider"),
+                role=source_node.get("role", roles.LEARNER),
+                language=source_node.get("language"),
+                thumbnail=source_node.get("thumbnail"),
+                derive_thumbnail=source_node.get("derive_thumbnail", False),
+                tags=source_node.get("tags"),
+            )
+
+            add_files(child_node, source_node.get("files") or [])
+            parent_node.add_child(child_node)
+            node_id = child_node.get_node_id().hex
+
+            # But, remove the child if it's the same ID so we can replace it w/ the remote node 
+            for i in range(len(parent_node.children)):
+                if parent_node.children[i].get_node_id().hex == node_id:
+                    removed = parent_node.children.pop(i)
+                    break
+            # use remote node if something was removed, if nothing was removed, we're done
+            if removed:
+                remote_node = nodes.StudioContentNode(PRADIGI_CHANNEL_ID, source_node_id=node_id, title=source_node["title"], description='')
+                remote_node.source_id = source_node["source_id"]
+                parent_node.add_child(remote_node)
+            #node_id = child_node.get_node_id().hex
+
+            #add_files(child_node, source_node.get("files") or [])
+            #for i in range(len(parent_node.children)):
+                #if parent_node.children[i].get_node_id().hex == node_id:
+                    #parent_node.children.pop(i)
+                    #break
+            # figure out how to remove the child - parent_node.children.pop()
+            # hard code channel_id to make it work on my staging channel
+            #child_node = nodes.StudioContentNode(PRADIGI_CHANNEL_ID, source_node_id=node_id, title=source_node["title"])
+            #import ipdb;ipdb.set_trace()
+            #child_node.source_id = source_node["source_id"]
+            #parent_node.add_child(child_node)
+
+        elif kind == AUDIO_NODE:
+            child_node = nodes.AudioNode(
+                source_id=source_node["source_id"],
+                title=source_node["title"],
+                description='',
+                license=get_license(**source_node["license"]),
+                author=source_node.get("author"),
+                aggregator=source_node.get("aggregator"),
+                provider=source_node.get("provider"),
+                role=source_node.get("role", roles.LEARNER),
+                language=source_node.get("language"),
+                thumbnail=source_node.get("thumbnail"),
+                derive_thumbnail=source_node.get("derive_thumbnail", False),
+                tags=source_node.get("tags"),
+            )
+            add_files(child_node, source_node.get("files") or [])
+            parent_node.add_child(child_node)
+            node_id = child_node.get_node_id().hex
+
+            # But, remove the child if it's the same ID so we can replace it w/ the remote node 
+            for i in range(len(parent_node.children)):
+                if parent_node.children[i].get_node_id().hex == node_id:
+                    removed = parent_node.children.pop(i)
+                    break
+            # use remote node if something was removed, if nothing was removed, we're done
+            if removed:
+                remote_node = nodes.StudioContentNode(PRADIGI_CHANNEL_ID, source_node_id=node_id, title=source_node["title"], description='')
+                remote_node.source_id = source_node["source_id"]
+                parent_node.add_child(remote_node)
+
+        elif kind == EXERCISE_NODE:
+            child_node = nodes.ExerciseNode(
+                source_id=source_node["source_id"],
+                title=source_node["title"],
+                description='',
+                license=get_license(**source_node["license"]),
+                author=source_node.get("author"),
+                aggregator=source_node.get("aggregator"),
+                provider=source_node.get("provider"),
+                role=source_node.get("role", roles.LEARNER),
+                language=source_node.get("language"),
+                thumbnail=source_node.get("thumbnail"),
+                derive_thumbnail=source_node.get(
+                    "derive_thumbnail", False
+                ),  # not supported yet
+                tags=source_node.get("tags"),
+                exercise_data=source_node.get("exercise_data"),
+                questions=[],
+            )
+            add_questions(child_node, source_node.get("questions") or [])
+            parent_node.add_child(child_node)
+            node_id = child_node.get_node_id().hex
+
+            # But, remove the child if it's the same ID so we can replace it w/ the remote node 
+            for i in range(len(parent_node.children)):
+                if parent_node.children[i].get_node_id().hex == node_id:
+                    removed = parent_node.children.pop(i)
+                    break
+            # use remote node if something was removed, if nothing was removed, we're done
+            if removed:
+                remote_node = nodes.StudioContentNode(PRADIGI_CHANNEL_ID, source_node_id=node_id, title=source_node["title"], description='')
+                remote_node.source_id = source_node["source_id"]
+                parent_node.add_child(remote_node)
+
+        elif kind == DOCUMENT_NODE:
+            child_node = nodes.DocumentNode(
+                source_id=source_node["source_id"],
+                title=source_node["title"],
+                description='',
+                license=get_license(**source_node["license"]),
+                author=source_node.get("author"),
+                aggregator=source_node.get("aggregator"),
+                provider=source_node.get("provider"),
+                role=source_node.get("role", roles.LEARNER),
+                language=source_node.get("language"),
+                thumbnail=source_node.get("thumbnail"),
+                tags=source_node.get("tags"),
+            )
+            # Things are just normal around here...
+            add_files(child_node, source_node.get("files") or [])
+            parent_node.add_child(child_node)
+            node_id = child_node.get_node_id().hex
+
+            # But, remove the child if it's the same ID so we can replace it w/ the remote node 
+            for i in range(len(parent_node.children)):
+                if parent_node.children[i].get_node_id().hex == node_id:
+                    removed = parent_node.children.pop(i)
+                    break
+            # use remote node if something was removed, if nothing was removed, we're done
+            if removed:
+                remote_node = nodes.StudioContentNode(PRADIGI_CHANNEL_ID, source_node_id=node_id, title=source_node["title"], description='')
+                remote_node.source_id = source_node["source_id"]
+                parent_node.add_child(remote_node)
+
+        elif kind == HTML5_NODE:
+            child_node = nodes.HTML5AppNode(
+                source_id=source_node["source_id"],
+                title=source_node["title"],
+                description='',
+                license=get_license(**source_node["license"]),
+                author=source_node.get("author"),
+                aggregator=source_node.get("aggregator"),
+                provider=source_node.get("provider"),
+                role=source_node.get("role", roles.LEARNER),
+                language=source_node.get("language"),
+                #thumbnail=source_node.get("thumbnail"),
+                #derive_thumbnail=source_node.get("derive_thumbnail", False),
+                tags=source_node.get("tags"),
+            )
+
+            add_files(child_node, source_node.get("files") or [])
+            parent_node.add_child(child_node)
+            node_id = child_node.get_node_id().hex
+
+            # But, remove the child if it's the same ID so we can replace it w/ the remote node 
+            for i in range(len(parent_node.children)):
+                if parent_node.children[i].get_node_id().hex == node_id:
+                    removed = parent_node.children.pop(i)
+                    break
+            # use remote node if something was removed, if nothing was removed, we're done
+            if removed:
+                remote_node = nodes.StudioContentNode(PRADIGI_CHANNEL_ID, source_node_id=node_id, title=source_node["title"], description='')
+                for i in range(len(remote_node.files)):
+                    if remote_node.files[i].preset == format_presets.HTML5_THUMBNAIL:
+                        remote_node.files.pop(i)
+                        logging.info("Removed thumbnail file from HTML5 APP {}".format(parent_node.children[i].title))
+                remote_node.source_id = source_node["source_id"]
+                parent_node.add_child(remote_node)
+                remote_node._set_thumbnail_file(format_presets.HTML5_THUMBNAIL)
+
+        elif kind == SLIDESHOW_NODE:
+            child_node = nodes.SlideshowNode(
+                source_id=source_node["source_id"],
+                title=source_node["title"],
+                description='',
+                license=get_license(**source_node["license"]),
+                author=source_node.get("author"),
+                aggregator=source_node.get("aggregator"),
+                provider=source_node.get("provider"),
+                role=source_node.get("role", roles.LEARNER),
+                language=source_node.get("language"),
+                thumbnail=source_node.get("thumbnail"),
+                derive_thumbnail=source_node.get("derive_thumbnail", False),
+                tags=source_node.get("tags"),
+            )
+            add_files(child_node, source_node.get("files") or [])
+            parent_node.add_child(child_node)
+            node_id = child_node.get_node_id().hex
+
+            # But, remove the child if it's the same ID so we can replace it w/ the remote node 
+            for i in range(len(parent_node.children)):
+                if parent_node.children[i].get_node_id().hex == node_id:
+                    removed = parent_node.children.pop(i)
+                    break
+            # use remote node if something was removed, if nothing was removed, we're done
+            if removed:
+                remote_node = nodes.StudioContentNode(PRADIGI_CHANNEL_ID, source_node_id=node_id, title=source_node["title"], description='')
+                remote_node.source_id = source_node["source_id"]
+                parent_node.add_child(remote_node)
+
+        # TODO: add support for H5P content kind
+
+        else:
+            LOGGER.critical("Encountered an unknown kind: " + str(source_node))
+            continue
+
+    return parent_node
 
 
 
@@ -764,11 +1104,23 @@ class PraDigiChef(JsonTreeChef):
         for lang in PRADIGI_WEBSITE_LANGUAGES:
             lang_games = extract_website_games_from_tree(lang)
             website_games[lang] = lang_games
-        WEBSITE_GAMES_OUTPUT = 'chefdata/vader/trees/website_games_all_langs.json'
+        WEBSITE_GAMES_OUTPUT = 'chefdata/trees/website_games_all_langs.json'
         # Save website games
         with open(WEBSITE_GAMES_OUTPUT, 'w') as json_file:
             json.dump(website_games, json_file, ensure_ascii=False, indent=2, sort_keys=True)
 
+    def construct_channel(self, **kwargs):
+        """
+        Build the channel tree by adding TopicNodes and ContentNode children.
+        """
+        channel = self.get_channel(**kwargs)
+        json_tree_path = self.get_json_tree_path(**kwargs)
+        json_tree = read_tree_from_json(json_tree_path)
+        build_tree_from_json(channel, json_tree["children"])
+        ## Create video node, get node ID, create RemoteNode in its place
+        ## vendor build_tree_from_json -- know vidoe & doc nodes need to be remove nodes
+        raise_for_invalid_channel(channel)
+        return channel
 
     def build_subtree_for_lang(self, lang):
         LOGGER.info('Building subtree for lang {}'.format(lang))
